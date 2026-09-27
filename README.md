@@ -1,4 +1,4 @@
-# LHA League Manager v2
+# LHA League Manager v2.2
 
 Replace your existing `app.py` with this version and update `requirements.txt`.
 
@@ -21,3 +21,16 @@ Upload `app.py`, `requirements.txt`, `.gitignore`, and this README to your exist
 
 ## Persistence
 This version still uses Streamlit session state. Download the JSON backup after sessions you want to preserve. The next architectural upgrade should be a persistent database so league state survives app restarts automatically.
+
+
+## v2.2 stabilization
+- No persistent database yet; session state remains the live store.
+- JSON backup/restore remains the safety mechanism.
+- Hardened empty-roster handling and schedule/team validation.
+- Corrected conservative playoff-clinch calculation.
+- Safer editing when a previously used goalie is no longer active.
+- Added playoff-bracket reset.
+- Backup restore validates and migrates missing state keys.
+- Import page shows the currently loaded roster/schedule/game counts.
+
+The goal of v2.2 is functional testing before persistent storage is introduced.
