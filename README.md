@@ -1,4 +1,4 @@
-# LHA League Manager v2.2
+# LHA League Manager v2.2.1
 
 Replace your existing `app.py` with this version and update `requirements.txt`.
 
@@ -34,3 +34,7 @@ This version still uses Streamlit session state. Download the JSON backup after 
 - Import page shows the currently loaded roster/schedule/game counts.
 
 The goal of v2.2 is functional testing before persistent storage is introduced.
+
+
+## v2.2.1 hotfix
+Rewrites the roster/schedule import handlers as explicit multiline try/except blocks and verifies both supplied CSVs parse with the expected required columns.

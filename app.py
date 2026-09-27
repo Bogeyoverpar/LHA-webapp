@@ -3,12 +3,12 @@ import pandas as pd
 import numpy as np
 import random,json,io,uuid
 from copy import deepcopy
-st.set_page_config(page_title="LHA League Manager v2.2",page_icon="🏒",layout="wide")
+st.set_page_config(page_title="LHA League Manager v2.2.1",page_icon="🏒",layout="wide")
 
 DIV={"East":["Boston Titans","D.C. Daggers","Toronto Stars","New York Chiefs","Ottawa Capitals","Philadelphia Liberty"],
 "West":["Seattle Wildcats","Vancouver Pilots","Los Angeles Jets","Colorado Knights","Detroit Flames","Chicago Railers"]}
 SET={"assist_probs":[.08,.27,.65],"learning":.20,"win_pts":2,"otl_pts":1}
-def fresh(): return {"version":2.2,"rosters":[],"schedule":[],"games":[],"overrides":{"team":{},"status":{},"seed":{}},"playoffs":{"generated":False,"series":[],"champion":None},"settings":deepcopy(SET)}
+def fresh(): return {"version":2.21,"rosters":[],"schedule":[],"games":[],"overrides":{"team":{},"status":{},"seed":{}},"playoffs":{"generated":False,"series":[],"champion":None},"settings":deepcopy(SET)}
 if "L" not in st.session_state: st.session_state.L=fresh()
 L=st.session_state.L
 for k,v in fresh().items():
@@ -172,7 +172,7 @@ def genpo():
     ss += [{"SeriesID":"MMC-F","Round":"Meyers Memorial Cup Finals","Division":"Final","Team1":"","Team2":""}]
     L["playoffs"]={"generated":True,"series":ss,"champion":None}
 
-st.title("🏒 LHA League Manager v2.2")
+st.title("🏒 LHA League Manager v2.2.1")
 page=st.sidebar.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","League Leaders","Game Log / Edit","Playoffs","Commissioner Overrides","Backup / Export"])
 if page=="Import / Setup":
     st.caption(f"Current session: {len(df('rosters'))} roster rows • {len(df('schedule'))} scheduled games • {len(L['games'])} completed games")
@@ -180,13 +180,26 @@ if page=="Import / Setup":
     with a:
         u=st.file_uploader("Roster CSV/XLSX",type=["csv","xlsx"])
         if u and st.button("Import roster"):
-            try:L["rosters"]=roster_import(upload(u)).to_dict("records");[st.warning(x) for x in validation()] if validation() else st.success("Roster imported and validated.")
-            except Exception as e:st.error(str(e))
+            try:
+                imported_roster = roster_import(upload(u))
+                L["rosters"] = imported_roster.to_dict("records")
+                errors = validation()
+                if errors:
+                    for error in errors:
+                        st.warning(error)
+                else:
+                    st.success("Roster imported and validated.")
+            except Exception as e:
+                st.error(str(e))
     with b:
         u=st.file_uploader("Schedule CSV/XLSX",type=["csv","xlsx"],key="su")
         if u and st.button("Import schedule"):
-            try:L["schedule"]=schedule_import(upload(u)).to_dict("records");st.success("Schedule imported.")
-            except Exception as e:st.error(str(e))
+            try:
+                imported_schedule = schedule_import(upload(u))
+                L["schedule"] = imported_schedule.to_dict("records")
+                st.success(f"Schedule imported: {len(imported_schedule)} games.")
+            except Exception as e:
+                st.error(str(e))
 elif page=="Weekly Games":
     s=df("schedule")
     if s.empty:st.info("Import a schedule first.")
