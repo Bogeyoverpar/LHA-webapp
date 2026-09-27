@@ -1,354 +1,267 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import json, io, random
-from datetime import datetime
+import random,json,io,uuid
+from copy import deepcopy
+st.set_page_config(page_title="LHA League Manager v2",page_icon="🏒",layout="wide")
 
-st.set_page_config(page_title="LHA League Manager", page_icon="🏒", layout="wide")
-
-DEFAULTS = {
-    "assist_probs": [0.08, 0.27, 0.65],   # 0, 1, 2 assists
-    "season_learning": 0.20,
-    "forward_goal_bonus": 1.20,
-    "defense_goal_bonus": 0.55,
-    "forward_assist_bonus": 1.05,
-    "defense_assist_bonus": 0.95,
-}
-
-def blank_state():
-    return {
-        "league_name": "LHA",
-        "rosters": [],
-        "schedule": [],
-        "games": [],
-        "events": [],
-        "goalie_games": [],
-        "settings": DEFAULTS.copy(),
-    }
-
-if "league" not in st.session_state:
-    st.session_state.league = blank_state()
-
-L = st.session_state.league
-
-def df(key):
-    return pd.DataFrame(L.get(key, []))
-
-def norm_pos(x):
-    return str(x).strip().upper()
-
-def load_table(upload):
-    name = upload.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(upload)
-    xls = pd.ExcelFile(upload)
-    return pd.read_excel(upload, sheet_name=0)
-
-def ensure_roster_columns(d):
-    aliases = {c.lower().strip(): c for c in d.columns}
-    required = ["team", "player", "position"]
-    missing = [x for x in required if x not in aliases]
-    if missing:
-        raise ValueError("Roster needs columns: Team, Player, Position. Missing: " + ", ".join(missing))
-    out = pd.DataFrame()
-    out["Team"] = d[aliases["team"]].astype(str).str.strip()
-    out["Player"] = d[aliases["player"]].astype(str).str.strip()
-    out["Position"] = d[aliases["position"]].astype(str).str.strip()
-    for col, default in [("Line", 3), ("Scoring", 70), ("Playmaking", 70), ("Active", True)]:
-        src = aliases.get(col.lower())
-        out[col] = d[src] if src else default
-    out["Line"] = pd.to_numeric(out["Line"], errors="coerce").fillna(3).clip(1, 4).astype(int)
-    out["Scoring"] = pd.to_numeric(out["Scoring"], errors="coerce").fillna(70).clip(1, 99)
-    out["Playmaking"] = pd.to_numeric(out["Playmaking"], errors="coerce").fillna(70).clip(1, 99)
-    out["Active"] = out["Active"].astype(str).str.lower().isin(["true","1","yes","y"]) if out["Active"].dtype == object else out["Active"].astype(bool)
-    out = out[(out.Team != "") & (out.Player != "")]
-    return out
-
-def ensure_schedule_columns(d):
-    aliases = {c.lower().strip(): c for c in d.columns}
-    required = ["week", "away", "home"]
-    missing = [x for x in required if x not in aliases]
-    if missing:
-        raise ValueError("Schedule needs columns: Week, Away, Home. Missing: " + ", ".join(missing))
-    out = pd.DataFrame()
-    out["Week"] = pd.to_numeric(d[aliases["week"]], errors="coerce").fillna(1).astype(int)
-    out["Away"] = d[aliases["away"]].astype(str).str.strip()
-    out["Home"] = d[aliases["home"]].astype(str).str.strip()
-    if "date" in aliases:
-        out["Date"] = d[aliases["date"]].astype(str)
-    else:
-        out["Date"] = ""
-    out["GameID"] = [f"W{w:02d}-{i+1:03d}" for i,w in enumerate(out["Week"])]
-    return out
-
-def completed_game_ids():
-    return {g["GameID"] for g in L["games"]}
-
-def player_totals():
-    r = df("rosters")
-    if r.empty:
-        return pd.DataFrame()
-    skaters = r[~r.Position.map(norm_pos).eq("G")].copy()
-    base = skaters[["Team","Player","Position"]].copy()
-    ev = df("events")
-    if ev.empty:
-        base["GP"] = base["G"] = base["A"] = base["PTS"] = 0
-        return base
-    games = df("games")
-    gp_rows = []
-    for _, g in games.iterrows():
-        for team in [g["Away"], g["Home"]]:
-            active = skaters[(skaters.Team == team) & skaters.Active.astype(bool)]
-            for p in active.Player:
-                gp_rows.append((team,p))
-    gp = pd.DataFrame(gp_rows, columns=["Team","Player"]).value_counts().rename("GP").reset_index() if gp_rows else pd.DataFrame(columns=["Team","Player","GP"])
-    goals = ev.groupby(["Team","Scorer"]).size().rename("G").reset_index().rename(columns={"Scorer":"Player"})
-    assists = pd.concat([
-        ev[["Team","Assist1"]].rename(columns={"Assist1":"Player"}),
-        ev[["Team","Assist2"]].rename(columns={"Assist2":"Player"})
-    ], ignore_index=True)
-    assists = assists[assists.Player.notna() & (assists.Player != "")]
-    assists = assists.groupby(["Team","Player"]).size().rename("A").reset_index()
-    out = base.merge(gp,on=["Team","Player"],how="left").merge(goals,on=["Team","Player"],how="left").merge(assists,on=["Team","Player"],how="left")
-    for c in ["GP","G","A"]:
-        out[c] = out[c].fillna(0).astype(int)
-    out["PTS"] = out["G"] + out["A"]
-    return out
-
-def goalie_totals():
-    gg = df("goalie_games")
-    if gg.empty:
-        return pd.DataFrame(columns=["Team","Goalie","GP","W","L","OTL","SA","SV","GA","SO","SV%","GAA"])
-    rows=[]
-    for (team,goalie),x in gg.groupby(["Team","Goalie"]):
-        gp=len(x); ga=x.GA.sum(); sv=x.SV.sum(); sa=x.SA.sum()
-        rows.append({
-            "Team":team,"Goalie":goalie,"GP":gp,
-            "W":int((x.Result=="W").sum()),"L":int((x.Result=="L").sum()),"OTL":int((x.Result=="OTL").sum()),
-            "SA":int(sa),"SV":int(sv),"GA":int(ga),"SO":int((x.GA==0).sum()),
-            "SV%": round(sv/sa,3) if sa else 0,
-            "GAA": round(ga/gp,2) if gp else 0,
-        })
-    return pd.DataFrame(rows)
-
-def standings():
-    teams = sorted(df("rosters").Team.unique()) if not df("rosters").empty else []
-    stats = {t: {"Team":t,"GP":0,"W":0,"L":0,"OTL":0,"GF":0,"GA":0,"PTS":0} for t in teams}
-    for g in L["games"]:
-        a,h=g["Away"],g["Home"]; ag,hg=int(g["AwayGoals"]),int(g["HomeGoals"])
-        if a not in stats: stats[a]={"Team":a,"GP":0,"W":0,"L":0,"OTL":0,"GF":0,"GA":0,"PTS":0}
-        if h not in stats: stats[h]={"Team":h,"GP":0,"W":0,"L":0,"OTL":0,"GF":0,"GA":0,"PTS":0}
-        for t,gf,ga in [(a,ag,hg),(h,hg,ag)]:
-            stats[t]["GP"]+=1; stats[t]["GF"]+=gf; stats[t]["GA"]+=ga
-        if ag>hg:
-            stats[a]["W"]+=1; stats[a]["PTS"]+=2
-            if g.get("OT",False): stats[h]["OTL"]+=1; stats[h]["PTS"]+=1
-            else: stats[h]["L"]+=1
-        else:
-            stats[h]["W"]+=1; stats[h]["PTS"]+=2
-            if g.get("OT",False): stats[a]["OTL"]+=1; stats[a]["PTS"]+=1
-            else: stats[a]["L"]+=1
-    out=pd.DataFrame(stats.values())
-    if out.empty: return out
-    out["DIFF"]=out["GF"]-out["GA"]
-    return out.sort_values(["PTS","W","DIFF","GF"],ascending=[False,False,False,False]).reset_index(drop=True)
-
-def weighted_pick(players, kind, excluded=None):
-    excluded = set(excluded or [])
-    p = players[~players.Player.isin(excluded)].copy()
-    if p.empty: return None
-    line_weight = p.Line.map({1:1.45,2:1.18,3:0.92,4:0.70}).fillna(1)
-    pos = p.Position.map(norm_pos)
-    if kind=="goal":
-        attr=p.Scoring.astype(float)
-        pos_weight=np.where(pos.isin(["LW","C","RW","F"]),L["settings"]["forward_goal_bonus"],L["settings"]["defense_goal_bonus"])
-    else:
-        attr=p.Playmaking.astype(float)
-        pos_weight=np.where(pos.isin(["LW","C","RW","F"]),L["settings"]["forward_assist_bonus"],L["settings"]["defense_assist_bonus"])
-    season=player_totals()
-    learn=np.ones(len(p))
-    if not season.empty and L["settings"]["season_learning"]>0:
-        m=p.merge(season[["Team","Player","GP","G","A"]],on=["Team","Player"],how="left").fillna(0)
-        rate=(m["G"] if kind=="goal" else m["A"])/(m["GP"].clip(lower=1))
-        if rate.max()>0:
-            learn=1 + L["settings"]["season_learning"]*(rate/(rate.max()+1e-9))
-    weights=np.maximum(0.01, attr/70*line_weight*pos_weight*learn)
-    return random.choices(list(p.Player), weights=list(weights), k=1)[0]
-
-def distribute_goals(team, n_goals, game_id):
-    roster=df("rosters")
-    p=roster[(roster.Team==team) & roster.Active.astype(bool) & ~roster.Position.map(norm_pos).eq("G")].copy()
-    events=[]
-    probs=L["settings"]["assist_probs"]
-    for goal_no in range(1,int(n_goals)+1):
-        scorer=weighted_pick(p,"goal")
-        n_ast=random.choices([0,1,2],weights=probs,k=1)[0]
-        a1=weighted_pick(p,"assist",[scorer]) if n_ast>=1 else None
-        a2=weighted_pick(p,"assist",[scorer,a1]) if n_ast>=2 else None
-        events.append({"GameID":game_id,"Team":team,"GoalNo":goal_no,"Scorer":scorer,"Assist1":a1 or "","Assist2":a2 or ""})
-    return events
-
-def team_goalies(team):
+DIV={"East":["Boston Titans","D.C. Daggers","Toronto Stars","New York Chiefs","Ottawa Capitals","Philadelphia Liberty"],
+"West":["Seattle Wildcats","Vancouver Pilots","Los Angeles Jets","Colorado Knights","Detroit Flames","Chicago Railers"]}
+SET={"assist_probs":[.08,.27,.65],"learning":.20,"win_pts":2,"otl_pts":1}
+def fresh(): return {"version":2,"rosters":[],"schedule":[],"games":[],"overrides":{"team":{},"status":{},"seed":{}},"playoffs":{"generated":False,"series":[],"champion":None},"settings":deepcopy(SET)}
+if "L" not in st.session_state: st.session_state.L=fresh()
+L=st.session_state.L
+for k,v in fresh().items():
+    if k not in L:L[k]=deepcopy(v)
+def df(k):return pd.DataFrame(L.get(k,[]))
+def P(x):return str(x).strip().upper()
+def upload(u):
+    raw=u.getvalue()
+    if u.name.lower().endswith(".csv"):
+        for enc in ["utf-8-sig","utf-8","cp1252","latin1"]:
+            try:return pd.read_csv(io.BytesIO(raw),encoding=enc)
+            except UnicodeDecodeError:pass
+        raise ValueError("CSV encoding could not be read.")
+    return pd.read_excel(io.BytesIO(raw))
+def roster_import(d):
+    a={str(c).strip().lower():c for c in d.columns}
+    miss=[x for x in ["team","player","position","line"] if x not in a]
+    if miss:raise ValueError("Missing: "+", ".join(miss))
+    o=pd.DataFrame({"Team":d[a["team"]].astype(str).str.strip(),"Player":d[a["player"]].astype(str).str.strip(),
+    "Position":d[a["position"]].astype(str).str.strip(),"Line":pd.to_numeric(d[a["line"]],errors="coerce").fillna(3).clip(1,4).astype(int)})
+    for c in ["Scoring","Playmaking"]:
+        o[c]=pd.to_numeric(d[a[c.lower()]],errors="coerce").fillna(70).clip(1,99) if c.lower() in a else 70
+    o["Active"]=d[a["active"]].astype(str).str.lower().isin(["true","1","yes","y"]) if "active" in a else True
+    return o[(o.Team!="")&(o.Player!="")]
+def schedule_import(d):
+    a={str(c).strip().lower():c for c in d.columns};miss=[x for x in ["week","away","home"] if x not in a]
+    if miss:raise ValueError("Missing: "+", ".join(miss))
+    o=pd.DataFrame({"Week":pd.to_numeric(d[a["week"]],errors="coerce").fillna(1).astype(int),"Away":d[a["away"]].astype(str).str.strip(),"Home":d[a["home"]].astype(str).str.strip()})
+    o["Date"]=d[a["date"]].astype(str) if "date" in a else ""
+    o["GameID"]=[f"REG-W{w:02d}-{i+1:03d}" for i,w in enumerate(o.Week)]
+    return o
+def validation():
+    r=df("rosters");e=[]
+    if r.empty:return ["Roster is empty."]
+    dup=r[r.duplicated(["Team","Player"],False)]
+    if not dup.empty:e.append("Duplicate players: "+", ".join((dup.Team+" — "+dup.Player).drop_duplicates()))
+    known=sum(DIV.values(),[])
+    bad=sorted(set(r.Team)-set(known))
+    if bad:e.append("Unknown division assignment: "+", ".join(bad))
+    for t in sorted(r.Team.unique()):
+        if not ((r.Team==t)&r.Position.map(P).eq("G")&r.Active.astype(bool)).any():e.append(t+" has no active goalie.")
+    return e
+def roster(t,g=False):
     r=df("rosters")
-    if r.empty:return []
-    return list(r[(r.Team==team)&r.Position.map(norm_pos).eq("G")].Player)
+    if r.empty:return r
+    m=(r.Team==t)&r.Active.astype(bool);m&=r.Position.map(P).eq("G") if g else ~r.Position.map(P).eq("G")
+    return r[m].drop_duplicates(["Team","Player"]).reset_index(drop=True)
+def regular():return [g for g in L["games"] if g.get("Stage","Regular")=="Regular"]
+def remaining(t):
+    s=df("schedule")
+    if s.empty:return 0
+    total=((s.Away==t)|(s.Home==t)).sum();played=sum(t in [g["Away"],g["Home"]] for g in regular())
+    return max(0,int(total-played))
+def standings():
+    s={t:{"Team":t,"Division":d,"GP":0,"W":0,"L":0,"OTL":0,"GF":0,"GA":0,"PTS":0} for d,ts in DIV.items() for t in ts}
+    for g in regular():
+        a,h=g["Away"],g["Home"];ag,hg=g["AwayGoals"],g["HomeGoals"]
+        if a not in s or h not in s:continue
+        for t,gf,ga in [(a,ag,hg),(h,hg,ag)]:s[t]["GP"]+=1;s[t]["GF"]+=gf;s[t]["GA"]+=ga
+        w,l=(a,h) if ag>hg else (h,a);s[w]["W"]+=1;s[w]["PTS"]+=2
+        if g["OT"]:s[l]["OTL"]+=1;s[l]["PTS"]+=1
+        else:s[l]["L"]+=1
+    for t,x in L["overrides"]["team"].items():
+        if t in s:
+            for k,v in x.items():
+                if k in s[t]:s[t][k]+=int(v)
+    d=pd.DataFrame(s.values());d["DIFF"]=d.GF-d.GA;d["GR"]=[remaining(t) for t in d.Team];return d
+def rank(div):
+    d=standings();return d[d.Division==div].sort_values(["PTS","W","DIFF","GF"],ascending=False).reset_index(drop=True)
+def statuses(div):
+    d=rank(div);out={}
+    for i,r in d.iterrows():
+        others=d[d.Team!=r.Team].copy();others["MAX"]=others.PTS+others.GR*2;mx=r.PTS+r.GR*2
+        po=(others.MAX<r.PTS).sum()>=2 # no more than 3 can possibly tie/exceed
+        elim=(others.PTS>mx).sum()>=4
+        dc=(others.MAX<r.PTS).all()
+        fifth=d.iloc[4] if len(d)>4 else None
+        pom=None if po or elim or fifth is None else max(0,int(fifth.PTS+fifth.GR*2+1-r.PTS))
+        dm=None
+        if i==0 and not dc and len(d)>1:dm=max(0,int(d.iloc[1].PTS+d.iloc[1].GR*2+1-r.PTS))
+        status="Eliminated" if elim else "Division Clinched" if dc else "Playoffs Clinched" if po else "Playoff Position" if i<4 else "In Hunt"
+        status=L["overrides"]["status"].get(r.Team,status);out[r.Team]=(status,pom,dm)
+    return out
+def skaters():
+    r=df("rosters")
+    if r.empty:return pd.DataFrame()
+    b=r[~r.Position.map(P).eq("G")][["Team","Player","Position"]].drop_duplicates().copy();gp={};go={};ast={}
+    for g in L["games"]:
+        for t in [g["Away"],g["Home"]]:
+            for p in roster(t).Player:gp[(t,p)]=gp.get((t,p),0)+1
+        for e in g.get("Events",[]):
+            k=(e["Team"],e["Scorer"]);go[k]=go.get(k,0)+1
+            for a in [e.get("Assist1",""),e.get("Assist2","")]:
+                if a:ast[(e["Team"],a)]=ast.get((e["Team"],a),0)+1
+    b["GP"]=[gp.get((t,p),0) for t,p in zip(b.Team,b.Player)];b["G"]=[go.get((t,p),0) for t,p in zip(b.Team,b.Player)];b["A"]=[ast.get((t,p),0) for t,p in zip(b.Team,b.Player)];b["PTS"]=b.G+b.A;return b
+def goalies():
+    rows=[q for g in L["games"] for q in g.get("Goalies",[])]
+    if not rows:return pd.DataFrame()
+    d=pd.DataFrame(rows);o=[]
+    for (t,p),x in d.groupby(["Team","Goalie"]):
+        sa=x.SA.sum();sv=x.SV.sum();ga=x.GA.sum();gp=len(x);o.append({"Team":t,"Goalie":p,"GP":gp,"W":(x.Result=="W").sum(),"L":(x.Result=="L").sum(),"OTL":(x.Result=="OTL").sum(),"SA":sa,"SV":sv,"GA":ga,"SO":(x.GA==0).sum(),"SV%":round(sv/sa,3) if sa else 0,"GAA":round(ga/gp,2)})
+    return pd.DataFrame(o)
+def pick(p,kind,exclude=[]):
+    p=p[~p.Player.isin([x for x in exclude if x])].drop_duplicates(["Team","Player"]).reset_index(drop=True)
+    if p.empty:return ""
+    line=p.Line.map({1:1.45,2:1.18,3:.92,4:.70}).fillna(1).to_numpy(float);positions=p.Position.map(P)
+    if kind=="G":attr=p.Scoring.to_numpy(float);pw=np.where(positions.isin(["LW","C","RW","F"]),1.2,.55)
+    else:attr=p.Playmaking.to_numpy(float);pw=np.where(positions.isin(["LW","C","RW","F"]),1.05,.95)
+    learn=np.ones(len(p));ss=skaters()
+    if not ss.empty:
+        m=p[["Team","Player"]].merge(ss.groupby(["Team","Player"],as_index=False).agg({"GP":"max","G":"sum","A":"sum"}),how="left",on=["Team","Player"],validate="one_to_one").fillna(0)
+        z=(m.G if kind=="G" else m.A).to_numpy(float)/np.maximum(m.GP.to_numpy(float),1)
+        if z.max()>0:learn=1+L["settings"]["learning"]*z/z.max()
+    w=np.maximum(np.nan_to_num(attr/70*line*pw*learn,nan=.01),.01)
+    return random.choices(p.Player.tolist(),weights=w.tolist(),k=1)[0]
+def events(t,n):
+    p=roster(t);o=[]
+    for i in range(n):
+        sc=pick(p,"G");na=random.choices([0,1,2],weights=L["settings"]["assist_probs"])[0];a1=pick(p,"A",[sc]) if na else "";a2=pick(p,"A",[sc,a1]) if na==2 else ""
+        o.append({"Team":t,"GoalNo":i+1,"Scorer":sc,"Assist1":a1,"Assist2":a2})
+    return o
+def makegame(gid,week,a,h,ag,hg,ot,agk,asa,hgk,hsa,stage="Regular",sid=None,ev=None):
+    if ag==hg:raise ValueError("Final score cannot be tied.")
+    if asa<hg or hsa<ag:raise ValueError("Shots against cannot be lower than goals allowed.")
+    w=a if ag>hg else h
+    qs=[{"Team":a,"Goalie":agk,"SA":asa,"SV":asa-hg,"GA":hg,"Result":"W" if w==a else "OTL" if ot else "L"},{"Team":h,"Goalie":hgk,"SA":hsa,"SV":hsa-ag,"GA":ag,"Result":"W" if w==h else "OTL" if ot else "L"}]
+    return {"GameID":gid,"Week":week,"Away":a,"Home":h,"AwayGoals":ag,"HomeGoals":hg,"OT":ot,"Stage":stage,"SeriesID":sid,"Events":ev if ev is not None else events(a,ag)+events(h,hg),"Goalies":qs}
+def wins(sid):
+    s=next(x for x in L["playoffs"]["series"] if x["SeriesID"]==sid);return {t:sum(((g["Away"]==t and g["AwayGoals"]>g["HomeGoals"])or(g["Home"]==t and g["HomeGoals"]>g["AwayGoals"])) for g in L["games"] if g.get("SeriesID")==sid) for t in [s["Team1"],s["Team2"]] if t}
+def sync():
+    if not L["playoffs"]["generated"]:return
+    z={s["SeriesID"]:s for s in L["playoffs"]["series"]};win={}
+    for s in z.values():
+        for t,n in wins(s["SeriesID"]).items():
+            if n>=4:win[s["SeriesID"]]=t
+    for d in ["East","West"]:z[d+"-F"]["Team1"]=win.get(d+"-SF1",z[d+"-F"]["Team1"]);z[d+"-F"]["Team2"]=win.get(d+"-SF2",z[d+"-F"]["Team2"])
+    z["MMC-F"]["Team1"]=win.get("East-F",z["MMC-F"]["Team1"]);z["MMC-F"]["Team2"]=win.get("West-F",z["MMC-F"]["Team2"]);L["playoffs"]["champion"]=win.get("MMC-F")
+def genpo():
+    ss=[]
+    for d in ["East","West"]:
+        ts=rank(d).Team.tolist()[:4];m=L["overrides"]["seed"].get(d,{})
+        ts=[m.get(str(i+1),t) for i,t in enumerate(ts)]
+        if len(ts)<4:raise ValueError("Need four "+d+" seeds.")
+        ss += [{"SeriesID":d+"-SF1","Round":"Division Semifinals","Division":d,"Team1":ts[0],"Team2":ts[3]},{"SeriesID":d+"-SF2","Round":"Division Semifinals","Division":d,"Team1":ts[1],"Team2":ts[2]},{"SeriesID":d+"-F","Round":"Division Finals","Division":d,"Team1":"","Team2":""}]
+    ss += [{"SeriesID":"MMC-F","Round":"Meyers Memorial Cup Finals","Division":"Final","Team1":"","Team2":""}]
+    L["playoffs"]={"generated":True,"series":ss,"champion":None}
 
-st.title("🏒 LHA League Manager")
-st.caption("Schedule → enter results → distribute scoring → standings and leaders update automatically.")
-
-with st.sidebar:
-    page=st.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","League Leaders","Game Log","Backup / Export"])
-    st.text_input("League name", key="league_name_ui", value=L.get("league_name","LHA"), on_change=lambda: None)
-    L["league_name"]=st.session_state.league_name_ui
-
+st.title("🏒 LHA League Manager v2")
+page=st.sidebar.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","League Leaders","Game Log / Edit","Playoffs","Commissioner Overrides","Backup / Export"])
 if page=="Import / Setup":
-    st.header("Import league")
-    c1,c2=st.columns(2)
-    with c1:
-        st.subheader("Rosters")
-        st.write("Required: **Team, Player, Position**. Optional: Line, Scoring, Playmaking, Active.")
-        up=st.file_uploader("Upload roster CSV/XLSX",type=["csv","xlsx"],key="roster")
-        if up and st.button("Import roster"):
-            try:
-                L["rosters"]=ensure_roster_columns(load_table(up)).to_dict("records")
-                st.success(f"Imported {len(L['rosters'])} players.")
-            except Exception as e: st.error(str(e))
-    with c2:
-        st.subheader("Schedule")
-        st.write("Required: **Week, Away, Home**. Optional: Date.")
-        up2=st.file_uploader("Upload schedule CSV/XLSX",type=["csv","xlsx"],key="schedule")
-        if up2 and st.button("Import schedule"):
-            try:
-                L["schedule"]=ensure_schedule_columns(load_table(up2)).to_dict("records")
-                st.success(f"Imported {len(L['schedule'])} games.")
-            except Exception as e: st.error(str(e))
-    st.divider()
-    st.subheader("Current setup")
-    r=df("rosters"); s=df("schedule")
-    st.metric("Players",len(r)); st.metric("Scheduled games",len(s))
-    if not r.empty: st.dataframe(r,use_container_width=True,hide_index=True)
-    if not s.empty: st.dataframe(s,use_container_width=True,hide_index=True)
-
+    a,b=st.columns(2)
+    with a:
+        u=st.file_uploader("Roster CSV/XLSX",type=["csv","xlsx"])
+        if u and st.button("Import roster"):
+            try:L["rosters"]=roster_import(upload(u)).to_dict("records");[st.warning(x) for x in validation()] if validation() else st.success("Roster imported and validated.")
+            except Exception as e:st.error(str(e))
+    with b:
+        u=st.file_uploader("Schedule CSV/XLSX",type=["csv","xlsx"],key="su")
+        if u and st.button("Import schedule"):
+            try:L["schedule"]=schedule_import(upload(u)).to_dict("records");st.success("Schedule imported.")
+            except Exception as e:st.error(str(e))
 elif page=="Weekly Games":
-    sched=df("schedule")
-    if sched.empty:
-        st.info("Import a schedule first.")
+    s=df("schedule")
+    if s.empty:st.info("Import a schedule first.")
     else:
-        weeks=sorted(sched.Week.unique())
-        week=st.selectbox("Week",weeks)
-        wk=sched[sched.Week==week]
-        done=completed_game_ids()
-        st.caption(f"{sum(g in done for g in wk.GameID)} of {len(wk)} games complete")
-        for _,game in wk.iterrows():
-            gid=game.GameID
-            with st.expander(f"{'✅' if gid in done else '⬜'} {game.Away} at {game.Home} {('— '+str(game.Date)) if str(game.Date) not in ['', 'nan'] else ''}", expanded=gid not in done):
-                if gid in done:
-                    g=next(x for x in L["games"] if x["GameID"]==gid)
-                    st.success(f"Final: {g['Away']} {g['AwayGoals']} — {g['Home']} {g['HomeGoals']}")
-                    ev=df("events"); st.dataframe(ev[ev.GameID==gid],use_container_width=True,hide_index=True)
-                    continue
-                a_goalies=team_goalies(game.Away); h_goalies=team_goalies(game.Home)
-                if not a_goalies or not h_goalies:
-                    st.warning("Both teams need at least one rostered player with Position = G.")
-                    continue
-                with st.form(f"form_{gid}"):
-                    a,b=st.columns(2)
-                    with a:
-                        st.markdown(f"**{game.Away}**")
-                        ag=st.number_input("Goals",0,30,0,key=f"ag{gid}")
-                        hgk=st.selectbox("Starting goalie",h_goalies,key=f"hgk{gid}",help=f"{game.Home} goalie facing {game.Away}")
-                        hsa=st.number_input(f"Shots faced by {game.Home} goalie",min_value=int(ag),max_value=100,value=max(int(ag),25),key=f"hsa{gid}")
-                    with b:
-                        st.markdown(f"**{game.Home}**")
-                        hg=st.number_input("Goals",0,30,0,key=f"hg{gid}")
-                        agk=st.selectbox("Starting goalie",a_goalies,key=f"agk{gid}",help=f"{game.Away} goalie facing {game.Home}")
-                        asa=st.number_input(f"Shots faced by {game.Away} goalie",min_value=int(hg),max_value=100,value=max(int(hg),25),key=f"asa{gid}")
-                    ot=st.checkbox("Game ended in overtime/shootout",key=f"ot{gid}")
-                    submit=st.form_submit_button("Finalize and distribute stats",type="primary")
-                if submit:
-                    if ag==hg:
-                        st.error("Final hockey score cannot be tied.")
-                    else:
-                        game_rec={"GameID":gid,"Week":int(game.Week),"Away":game.Away,"Home":game.Home,"AwayGoals":int(ag),"HomeGoals":int(hg),"OT":bool(ot),"Date":str(game.Date)}
-                        L["games"].append(game_rec)
-                        L["events"].extend(distribute_goals(game.Away,ag,gid))
-                        L["events"].extend(distribute_goals(game.Home,hg,gid))
-                        winner=game.Away if ag>hg else game.Home
-                        for team,goalie,sa,ga in [(game.Away,agk,asa,hg),(game.Home,hgk,hsa,ag)]:
-                            if team==winner: result="W"
-                            else: result="OTL" if ot else "L"
-                            L["goalie_games"].append({"GameID":gid,"Team":team,"Goalie":goalie,"SA":int(sa),"SV":int(sa-ga),"GA":int(ga),"Result":result})
-                        st.success("Game finalized. Scoring, goalie stats, standings and leaders updated.")
-                        st.rerun()
-
+        wk=st.selectbox("Week",sorted(s.Week.unique()));done={g["GameID"] for g in regular()}
+        for _,x in s[s.Week==wk].iterrows():
+            with st.expander(("✅ " if x.GameID in done else "⬜ ")+x.Away+" at "+x.Home,expanded=x.GameID not in done):
+                if x.GameID in done:st.write("Completed — edit it under Game Log / Edit.");continue
+                A=roster(x.Away,True).Player.tolist();H=roster(x.Home,True).Player.tolist()
+                if not A or not H:st.error("Both teams need an active goalie.");continue
+                with st.form(x.GameID):
+                    c1,c2=st.columns(2)
+                    with c1:ag=st.number_input(x.Away+" goals",0,30,0);agk=st.selectbox(x.Away+" goalie",A);asa=st.number_input(x.Away+" goalie SA",0,100,25)
+                    with c2:hg=st.number_input(x.Home+" goals",0,30,0);hgk=st.selectbox(x.Home+" goalie",H);hsa=st.number_input(x.Home+" goalie SA",0,100,25)
+                    ot=st.checkbox("OT / shootout");go=st.form_submit_button("Finalize & distribute")
+                if go:
+                    try:L["games"].append(makegame(x.GameID,int(x.Week),x.Away,x.Home,ag,hg,ot,agk,asa,hgk,hsa));st.rerun()
+                    except Exception as e:st.error(str(e))
 elif page=="Standings":
-    st.header("Standings")
-    s=standings()
-    if s.empty: st.info("No completed games yet.")
-    else:
-        s.index=np.arange(1,len(s)+1)
-        st.dataframe(s,use_container_width=True)
-
+    st.header("Standings & Playoff Race")
+    for col,dv in zip(st.columns(2),["East","West"]):
+        with col:
+            st.subheader(dv);d=rank(dv);q=statuses(dv);d.insert(0,"Seed",range(1,len(d)+1));d["Status"]=[q[t][0] for t in d.Team];d["PO Magic"]=[q[t][1] for t in d.Team];d["DIV Magic"]=[q[t][2] for t in d.Team]
+            st.dataframe(d[["Seed","Team","GP","W","L","OTL","GF","GA","DIFF","PTS","GR","Status","PO Magic","DIV Magic"]],hide_index=True,use_container_width=True)
+    d=standings().sort_values(["PTS","W","DIFF","GF"],ascending=False).reset_index(drop=True)
+    if len(d):
+        leader=d.iloc[0];other=d.iloc[1:].copy();other["MAX"]=other.PTS+other.GR*2;cl=(other.MAX<leader.PTS).all();magic=None if cl else max(0,int(other.MAX.max()+1-leader.PTS))
+        st.info(f"Best overall: {leader.Team} — "+("best regular-season record clinched" if cl else f"league magic # {magic}"))
 elif page=="League Leaders":
-    st.header("League Leaders")
-    sk=player_totals()
-    gg=goalie_totals()
-    t1,t2=st.tabs(["Skaters","Goalies"])
-    with t1:
-        if sk.empty: st.info("No player stats yet.")
-        else:
-            sort=st.selectbox("Sort skaters by",["PTS","G","A","GP"])
-            st.dataframe(sk.sort_values([sort,"PTS","G"],ascending=False).reset_index(drop=True),use_container_width=True,hide_index=True)
-    with t2:
-        if gg.empty: st.info("No goalie stats yet.")
-        else:
-            st.dataframe(gg.sort_values(["W","SV%","SO"],ascending=False).reset_index(drop=True),use_container_width=True,hide_index=True)
-
-elif page=="Game Log":
-    st.header("Game Log")
-    games=df("games")
-    if games.empty: st.info("No games completed yet.")
+    a,b=st.tabs(["Skaters","Goalies"])
+    with a:
+        d=skaters();st.dataframe(d.sort_values(["PTS","G","A"],ascending=False),hide_index=True,use_container_width=True) if not d.empty else st.info("No stats.")
+    with b:
+        d=goalies();st.dataframe(d.sort_values(["W","SV%","SO"],ascending=False),hide_index=True,use_container_width=True) if not d.empty else st.info("No stats.")
+elif page=="Game Log / Edit":
+    if not L["games"]:st.info("No games.")
     else:
-        st.dataframe(games.sort_values(["Week","GameID"]),use_container_width=True,hide_index=True)
-        gid=st.selectbox("View scoring detail",games.GameID)
-        ev=df("events")
-        st.dataframe(ev[ev.GameID==gid],use_container_width=True,hide_index=True)
-
+        i=st.selectbox("Game",range(len(L["games"])),format_func=lambda i:f"{L['games'][i]['GameID']} — {L['games'][i]['Away']} {L['games'][i]['AwayGoals']}, {L['games'][i]['Home']} {L['games'][i]['HomeGoals']}");g=L["games"][i]
+        with st.form("edit"):
+            c1,c2=st.columns(2);A=roster(g["Away"],True).Player.tolist();H=roster(g["Home"],True).Player.tolist()
+            with c1:ag=st.number_input(g["Away"]+" goals",0,30,g["AwayGoals"]);agk=st.selectbox("Away goalie",A,index=A.index(g["Goalies"][0]["Goalie"]) if g["Goalies"][0]["Goalie"] in A else 0);asa=st.number_input("Away goalie SA",0,100,g["Goalies"][0]["SA"])
+            with c2:hg=st.number_input(g["Home"]+" goals",0,30,g["HomeGoals"]);hgk=st.selectbox("Home goalie",H,index=H.index(g["Goalies"][1]["Goalie"]) if g["Goalies"][1]["Goalie"] in H else 0);hsa=st.number_input("Home goalie SA",0,100,g["Goalies"][1]["SA"])
+            ot=st.checkbox("OT/SO",g["OT"]);regen=st.checkbox("Regenerate scoring events",False);save=st.form_submit_button("Save game corrections")
+        if save:
+            try:L["games"][i]=makegame(g["GameID"],g["Week"],g["Away"],g["Home"],ag,hg,ot,agk,asa,hgk,hsa,g["Stage"],g.get("SeriesID"),None if regen or ag!=g["AwayGoals"] or hg!=g["HomeGoals"] else g["Events"]);sync();st.rerun()
+            except Exception as e:st.error(str(e))
+        st.subheader("Manual scorers / assists");edited=[]
+        for j,e in enumerate(g["Events"]):
+            with st.expander(f"Goal {j+1}: {e['Scorer']} — {e['Team']}"):
+                ps=roster(e["Team"]).Player.tolist();opts=[""]+ps;sc=st.selectbox("Scorer",ps,index=ps.index(e["Scorer"]) if e["Scorer"] in ps else 0,key=f"s{i}{j}");a1=st.selectbox("Assist 1",opts,index=opts.index(e.get("Assist1","")) if e.get("Assist1","") in opts else 0,key=f"x{i}{j}");a2=st.selectbox("Assist 2",opts,index=opts.index(e.get("Assist2","")) if e.get("Assist2","") in opts else 0,key=f"y{i}{j}");edited.append({**e,"Scorer":sc,"Assist1":a1,"Assist2":a2})
+        if st.button("Save scoring edits"):L["games"][i]["Events"]=edited;st.rerun()
+        if st.button("Delete game"):L["games"].pop(i);sync();st.rerun()
+elif page=="Playoffs":
+    st.header("Meyers Memorial Cup Playoffs")
+    if not L["playoffs"]["generated"]:
+        if st.button("Generate playoff bracket"):genpo();st.rerun()
+    else:
+        sync()
+        if L["playoffs"]["champion"]:st.success("🏆 Meyers Memorial Cup Champion: "+L["playoffs"]["champion"])
+        for s in L["playoffs"]["series"]:
+            st.subheader(s["Round"]+" — "+s["Division"]);t1,t2=s["Team1"],s["Team2"]
+            if not t1 or not t2:st.caption("Waiting for previous series.");continue
+            w=wins(s["SeriesID"]);st.write(f"**{t1} {w.get(t1,0)} — {w.get(t2,0)} {t2}**")
+            if max(w.values() or [0])>=4:continue
+            n=sum(w.values())+1
+            with st.form("po"+s["SeriesID"]):
+                away=st.selectbox("Away",[t1,t2],key="aa"+s["SeriesID"]);home=t2 if away==t1 else t1;st.write("Home: "+home);A=roster(away,True).Player.tolist();H=roster(home,True).Player.tolist()
+                ag=st.number_input("Away goals",0,30,0,key="ag"+s["SeriesID"]);hg=st.number_input("Home goals",0,30,0,key="hg"+s["SeriesID"]);agk=st.selectbox("Away goalie",A,key="ak"+s["SeriesID"]);hgk=st.selectbox("Home goalie",H,key="hk"+s["SeriesID"]);asa=st.number_input("Away goalie SA",0,100,25,key="as"+s["SeriesID"]);hsa=st.number_input("Home goalie SA",0,100,25,key="hs"+s["SeriesID"]);ot=st.checkbox("OT/SO",key="ot"+s["SeriesID"]);go=st.form_submit_button(f"Finalize Game {n}")
+            if go:
+                try:L["games"].append(makegame(f"PO-{s['SeriesID']}-G{n}",n,away,home,ag,hg,ot,agk,asa,hgk,hsa,s["Round"],s["SeriesID"]));sync();st.rerun()
+                except Exception as e:st.error(str(e))
+elif page=="Commissioner Overrides":
+    st.header("Commissioner Overrides")
+    a,b,c=st.tabs(["Standings","Status","Seeds"])
+    with a:
+        t=st.selectbox("Team",sum(DIV.values(),[]));cur=L["overrides"]["team"].get(t,{});p=st.number_input("Points adjustment",value=int(cur.get("PTS",0)),step=1);w=st.number_input("Win adjustment",value=int(cur.get("W",0)),step=1);ls=st.number_input("Loss adjustment",value=int(cur.get("L",0)),step=1);o=st.number_input("OTL adjustment",value=int(cur.get("OTL",0)),step=1)
+        if st.button("Save adjustment"):L["overrides"]["team"][t]={"PTS":p,"W":w,"L":ls,"OTL":o};st.rerun()
+        if st.button("Reset adjustment"):L["overrides"]["team"].pop(t,None);st.rerun()
+    with b:
+        t=st.selectbox("Team",sum(DIV.values(),[]),key="st");vals=["Automatic","In Hunt","Playoff Position","Playoffs Clinched","Division Clinched","Eliminated"];v=st.selectbox("Status",vals)
+        if st.button("Save status"):L["overrides"]["status"].pop(t,None) if v=="Automatic" else L["overrides"]["status"].update({t:v});st.rerun()
+    with c:
+        dv=st.selectbox("Division",["East","West"]);auto=rank(dv).Team.tolist();sel={}
+        for n in range(1,5):sel[str(n)]=st.selectbox(f"Seed #{n}",DIV[dv],index=DIV[dv].index(L["overrides"]["seed"].get(dv,{}).get(str(n),auto[n-1] if len(auto)>=n else DIV[dv][n-1])),key=f"sd{dv}{n}")
+        if st.button("Save seeds"):
+            if len(set(sel.values()))<4:st.error("Seeds must be unique.")
+            else:L["overrides"]["seed"][dv]=sel;st.rerun()
 elif page=="Backup / Export":
-    st.header("Backup and export")
-    payload=json.dumps(L,indent=2)
-    st.download_button("Download league backup (.json)",payload,file_name=f"{L['league_name'].replace(' ','_')}_backup.json",mime="application/json")
-    backup=st.file_uploader("Restore league backup",type=["json"])
-    if backup and st.button("Restore backup"):
-        st.session_state.league=json.load(backup)
-        st.success("Backup restored.")
-        st.rerun()
-    st.divider()
-    st.subheader("CSV exports")
-    for label,key,func in [
-        ("Standings","standings",standings),
-        ("Skater stats","skater_stats",player_totals),
-        ("Goalie stats","goalie_stats",goalie_totals),
-        ("Games","games",lambda:df("games")),
-        ("Scoring events","scoring_events",lambda:df("events"))
-    ]:
-        d=func()
-        st.download_button(f"Download {label}",d.to_csv(index=False),file_name=f"{key}.csv",mime="text/csv",disabled=d.empty)
-
+    st.download_button("Download complete JSON backup",json.dumps(L,indent=2),"LHA_backup.json","application/json");u=st.file_uploader("Restore backup",type=["json"])
+    if u and st.button("Restore"):st.session_state.L=json.loads(u.getvalue().decode());st.rerun()
+    for n,d in [("standings",standings()),("skaters",skaters()),("goalies",goalies())]:st.download_button("Download "+n+".csv",d.to_csv(index=False),n+".csv","text/csv",disabled=d.empty)
 else:
-    st.header(L.get("league_name","LHA"))
-    games=df("games"); sched=df("schedule")
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Teams",df("rosters").Team.nunique() if not df("rosters").empty else 0)
-    c2.metric("Games played",len(games))
-    c3.metric("Games scheduled",len(sched))
-    c4.metric("Goals scored",int(games.AwayGoals.sum()+games.HomeGoals.sum()) if not games.empty else 0)
-    st.subheader("Current standings")
-    s=standings()
-    if not s.empty: st.dataframe(s.head(10),use_container_width=True,hide_index=True)
-    st.subheader("Upcoming")
-    if sched.empty: st.info("Import a schedule to begin.")
-    else:
-        done=completed_game_ids()
-        upcoming=sched[~sched.GameID.isin(done)].sort_values(["Week","GameID"]).head(10)
-        st.dataframe(upcoming,use_container_width=True,hide_index=True)
+    st.header("LHA Dashboard");c=st.columns(4);c[0].metric("Teams",12);c[1].metric("Games played",len(regular()));c[2].metric("Goals",sum(g["AwayGoals"]+g["HomeGoals"] for g in regular()));c[3].metric("Playoffs","Active" if L["playoffs"]["generated"] else "Not started")
+    for col,dv in zip(st.columns(2),["East","West"]):
+        with col:st.subheader(dv);st.dataframe(rank(dv)[["Team","GP","W","L","OTL","PTS"]],hide_index=True,use_container_width=True)
