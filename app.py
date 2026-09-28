@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import random,json,io,uuid
 from copy import deepcopy
-st.set_page_config(page_title="LHA League Manager v2.3",page_icon="🏒",layout="wide")
+st.set_page_config(page_title="LHA League Manager v2.3.1",page_icon="🏒",layout="wide")
 
 DIV={"East":["Boston Titans","D.C. Daggers","Toronto Stars","New York Chiefs","Ottawa Capitals","Philadelphia Liberty"],
 "West":["Seattle Wildcats","Vancouver Pilots","Los Angeles Jets","Colorado Knights","Detroit Flames","Chicago Railers"]}
@@ -230,7 +230,7 @@ def record_transaction(kind,pid,to_team,to_level,notes):
 def po_series_schedule(high,low):
     return [(n, low if n in [1,2,6,7] else high, high if n in [1,2,6,7] else low) for n in range(1,8)]
 
-st.title("🏒 LHA League Manager v2.3")
+st.title("🏒 LHA League Manager v2.3.1")
 page=st.sidebar.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","Statistics","Game Log / Edit","Playoffs","Transactions & Honors","Commissioner Overrides","Backup / Export"])
 if page=="Import / Setup":
     st.caption(f"Current session: {len(df('rosters'))} roster rows • {len(df('schedule'))} scheduled games • {len(L['games'])} completed games")
@@ -282,12 +282,27 @@ elif page=="Standings":
     if len(d):
         leader=d.iloc[0];other=d.iloc[1:].copy();other["MAX"]=other.PTS+other.GR*2;cl=(other.MAX<leader.PTS).all();magic=None if cl else max(0,int(other.MAX.max()+1-leader.PTS))
         st.info(f"Best overall: {leader.Team} — "+("best regular-season record clinched" if cl else f"league magic # {magic}"))
-elif page=="League Leaders":
-    a,b=st.tabs(["Skaters","Goalies"])
-    with a:
-        d=skaters();st.dataframe(d.sort_values(["PTS","G","A"],ascending=False),hide_index=True,use_container_width=True) if not d.empty else st.info("No stats.")
-    with b:
-        d=goalies();st.dataframe(d.sort_values(["W","SV%","SO"],ascending=False),hide_index=True,use_container_width=True) if not d.empty else st.info("No stats.")
+elif page=="Statistics":
+    st.header("League Statistics")
+    kind=st.radio("Stat split",["Regular","Playoffs","Combined"],horizontal=True)
+    skater_tab,goalie_tab=st.tabs(["Skaters","Goalies"])
+    with skater_tab:
+        d=skaters_by_type(kind)
+        if d.empty:st.info(f"No {kind.lower()} skater statistics yet.")
+        else:
+            sort_col=st.selectbox("Sort skaters by",["PTS","G","A","GP"],key="skater_sort")
+            d=d.sort_values([sort_col,"G","A"],ascending=False).reset_index(drop=True)
+            d.insert(0,"Rank",range(1,len(d)+1))
+            st.dataframe(d[["Rank","Player","Team","GP","G","A","PTS"]],hide_index=True,use_container_width=True)
+    with goalie_tab:
+        d=goalies_by_type(kind)
+        if d.empty:st.info(f"No {kind.lower()} goalie statistics yet.")
+        else:
+            sort_col=st.selectbox("Sort goalies by",["W","SV%","GAA","SO","GP"],key="goalie_sort")
+            d=d.sort_values(sort_col,ascending=(sort_col=="GAA")).reset_index(drop=True)
+            d.insert(0,"Rank",range(1,len(d)+1))
+            st.dataframe(d[["Rank","Goalie","Team","GP","W","L","OTL","SA","SV","GA","SV%","GAA","SO"]],hide_index=True,use_container_width=True)
+
 elif page=="Game Log / Edit":
     if not L["games"]:st.info("No games.")
     else:
@@ -416,7 +431,10 @@ elif page=="Backup / Export":
         except Exception as e:
             st.error("Could not restore backup: "+str(e))
     for n,d in [("standings",standings()),("skaters",skaters()),("goalies",goalies())]:st.download_button("Download "+n+".csv",d.to_csv(index=False),n+".csv","text/csv",disabled=d.empty)
-else:
+elif page=="Dashboard":
     st.header("LHA Dashboard");c=st.columns(4);c[0].metric("Teams",12);c[1].metric("Games played",len(regular()));c[2].metric("Goals",sum(g["AwayGoals"]+g["HomeGoals"] for g in regular()));c[3].metric("Playoffs","Active" if L["playoffs"]["generated"] else "Not started")
     for col,dv in zip(st.columns(2),["East","West"]):
         with col:st.subheader(dv);st.dataframe(rank(dv)[["Team","GP","W","L","OTL","PTS"]],hide_index=True,use_container_width=True)
+
+else:
+    st.error(f"Unknown page route: {page}")
