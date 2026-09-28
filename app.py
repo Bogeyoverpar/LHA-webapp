@@ -1,22 +1,25 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import random,json,io,uuid
+import random,json,io,uuid,base64
 from copy import deepcopy
 
-st.set_page_config(page_title="LHA / MLH League Manager v2.4",page_icon="🏒",layout="wide")
+st.set_page_config(page_title="LHA / MLH League Manager v2.5",page_icon="🏒",layout="wide")
 
 LHA_DIV={
 "East":["Boston Titans","D.C. Daggers","Toronto Stars","New York Chiefs","Ottawa Capitals","Philadelphia Liberty"],
 "West":["Seattle Wildcats","Vancouver Pilots","Los Angeles Jets","Colorado Knights","Detroit Flames","Chicago Railers"]}
-MLH_TEAMS=["Anchorage","Bellingham","Erie","Kingston","Rapid City","Syracuse"]
+MLH_TEAMS=["Anchorage Bush Pilots","Bellingham Blades","Erie Thunderbirds","Kingston Corsairs","Rapid City Scouts","Syracuse IceHawks"]
+MLH_ALIASES={
+"Anchorage":"Anchorage Bush Pilots","Bellingham":"Bellingham Blades","Erie":"Erie Thunderbirds",
+"Kingston":"Kingston Corsairs","Rapid City":"Rapid City Scouts","Syracuse":"Syracuse IceHawks"}
 AFFILIATES={
-"Anchorage":["Seattle Wildcats","Vancouver Pilots"],
-"Bellingham":["Colorado Knights","Los Angeles Jets"],
-"Erie":["Philadelphia Liberty","Toronto Stars"],
-"Kingston":["Boston Titans","Ottawa Capitals"],
-"Rapid City":["Chicago Railers","Detroit Flames"],
-"Syracuse":["D.C. Daggers","New York Chiefs"]}
+"Anchorage Bush Pilots":["Seattle Wildcats","Vancouver Pilots"],
+"Bellingham Blades":["Colorado Knights","Los Angeles Jets"],
+"Erie Thunderbirds":["Philadelphia Liberty","Toronto Stars"],
+"Kingston Corsairs":["Boston Titans","Ottawa Capitals"],
+"Rapid City Scouts":["Chicago Railers","Detroit Flames"],
+"Syracuse IceHawks":["D.C. Daggers","New York Chiefs"]}
 ARENAS={
 "Boston Titans":"Commonwealth Garden","D.C. Daggers":"Capital Forum","Toronto Stars":"CN Arena",
 "New York Chiefs":"Empire Center","Ottawa Capitals":"National Arena","Philadelphia Liberty":"Liberty Center",
@@ -27,7 +30,7 @@ ROSTER_COLS=["PlayerID","League","Team","Player","Position","Line","Scoring","Pl
 SCHEDULE_COLS=["League","Week","Away","Home","Date","GameID"]
 
 def fresh():
-    return {"version":"2.4","rosters":[],"schedule":[],"games":[],"transactions":[],"selections":[],
+    return {"version":"2.5","rosters":[],"schedule":[],"games":[],"transactions":[],"selections":[],
             "team_info":{},"overrides":{"team":{},"status":{},"seed":{}},
             "playoffs":{"LHA":{"generated":False,"series":[],"champion":None},
                         "MLH":{"generated":False,"series":[],"champion":None}},
@@ -49,10 +52,47 @@ for rec in L.get("schedule",[]):
     rec.setdefault("League","MLH" if rec.get("Away") in MLH_TEAMS else "LHA")
 for g in L.get("games",[]):
     g.setdefault("League","MLH" if g.get("Away") in MLH_TEAMS else "LHA")
+# Canonicalize old city-only MLH data from early v2.4 builds.
+def canon_team(t):
+    return MLH_ALIASES.get(str(t).strip(),str(t).strip())
+
+for rec in L.get("rosters",[]):
+    rec["Team"]=canon_team(rec.get("Team",""))
+    if rec["Team"] in MLH_TEAMS: rec["League"]="MLH"
+for rec in L.get("schedule",[]):
+    rec["Away"]=canon_team(rec.get("Away","")); rec["Home"]=canon_team(rec.get("Home",""))
+    if rec["Away"] in MLH_TEAMS or rec["Home"] in MLH_TEAMS: rec["League"]="MLH"
+for g in L.get("games",[]):
+    g["Away"]=canon_team(g.get("Away","")); g["Home"]=canon_team(g.get("Home",""))
+    if g["Away"] in MLH_TEAMS or g["Home"] in MLH_TEAMS: g["League"]="MLH"
+    for e in g.get("Events",[]): e["Team"]=canon_team(e.get("Team",""))
+    for q in g.get("Goalies",[]): q["Team"]=canon_team(q.get("Team",""))
+for rec in L.get("transactions",[]):
+    if "FromTeam" in rec: rec["FromTeam"]=canon_team(rec["FromTeam"])
+    if "ToTeam" in rec: rec["ToTeam"]=canon_team(rec["ToTeam"])
+for rec in L.get("selections",[]):
+    if "Team" in rec: rec["Team"]=canon_team(rec["Team"])
+for lg in ["LHA","MLH"]:
+    for s in L.get("playoffs",{}).get(lg,{}).get("series",[]):
+        s["Team1"]=canon_team(s.get("Team1","")); s["Team2"]=canon_team(s.get("Team2",""))
+    ch=L.get("playoffs",{}).get(lg,{}).get("champion")
+    if ch: L["playoffs"][lg]["champion"]=canon_team(ch)
+for old,new in MLH_ALIASES.items():
+    if old in L["team_info"] and new not in L["team_info"]:
+        L["team_info"][new]=L["team_info"].pop(old)
+    elif old in L["team_info"]:
+        L["team_info"].pop(old,None)
+
+INFO_DEFAULT={"Coach":"","GM":"","Arena":"","Notes":"","LogoData":"","LogoType":"",
+              "Championships":"","DivisionTitles":"","RetiredNumbers":"","TeamHonors":""}
 for t in sum(LHA_DIV.values(),[]):
-    L["team_info"].setdefault(t,{"Coach":"","GM":"","Arena":ARENAS.get(t,""),"Notes":""})
+    base=deepcopy(INFO_DEFAULT); base["Arena"]=ARENAS.get(t,"")
+    cur=L["team_info"].setdefault(t,base)
+    for k,v in base.items(): cur.setdefault(k,v)
 for t in MLH_TEAMS:
-    L["team_info"].setdefault(t,{"Coach":"","GM":"","Arena":"","Notes":"","Affiliates":", ".join(AFFILIATES[t])})
+    base=deepcopy(INFO_DEFAULT); base["Affiliates"]=", ".join(AFFILIATES[t])
+    cur=L["team_info"].setdefault(t,base)
+    for k,v in base.items(): cur.setdefault(k,v)
 
 def teams(league):
     return sum(LHA_DIV.values(),[]) if league=="LHA" else MLH_TEAMS
@@ -80,7 +120,7 @@ def roster_import(d,default_league):
     a={str(c).strip().lower():c for c in d.columns}
     miss=[x for x in ["team","player","position","line"] if x not in a]
     if miss:raise ValueError("Missing: "+", ".join(miss))
-    o=pd.DataFrame({"Team":d[a["team"]].astype(str).str.strip(),"Player":d[a["player"]].astype(str).str.strip(),
+    o=pd.DataFrame({"Team":d[a["team"]].astype(str).str.strip().map(canon_team),"Player":d[a["player"]].astype(str).str.strip(),
                     "Position":d[a["position"]].astype(str).str.strip(),
                     "Line":pd.to_numeric(d[a["line"]],errors="coerce").fillna(3).clip(1,4).astype(int)})
     o["League"]=d[a["league"]].astype(str).str.upper().str.strip() if "league" in a else default_league
@@ -95,7 +135,7 @@ def schedule_import(d,league):
     miss=[x for x in ["week","away","home"] if x not in a]
     if miss:raise ValueError("Missing: "+", ".join(miss))
     o=pd.DataFrame({"League":league,"Week":pd.to_numeric(d[a["week"]],errors="coerce").fillna(1).astype(int),
-                    "Away":d[a["away"]].astype(str).str.strip(),"Home":d[a["home"]].astype(str).str.strip()})
+                    "Away":d[a["away"]].astype(str).str.strip().map(canon_team),"Home":d[a["home"]].astype(str).str.strip().map(canon_team)})
     o["Date"]=d[a["date"]].astype(str) if "date" in a else ""
     o["GameID"]=[f"{league}-REG-W{w:02d}-{i+1:03d}" for i,w in enumerate(o.Week)]
     return o[SCHEDULE_COLS]
@@ -253,7 +293,46 @@ def record_transaction(kind,pid,to_team,notes):
                               "FromLeague":old_league,"FromTeam":old_team,"ToLeague":L["rosters"][i]["League"],
                               "ToTeam":L["rosters"][i]["Team"],"Notes":notes})
 
-st.title("🏒 LHA / MLH League Manager v2.4")
+def bracket_card(title,team1,team2,wins=None):
+    wins=wins or {}
+    a=team1 or "TBD"; b=team2 or "TBD"
+    aw=wins.get(team1,0) if team1 else 0; bw=wins.get(team2,0) if team2 else 0
+    st.markdown(f"""<div style="border:1px solid #777;border-radius:8px;padding:10px;margin:8px 0;background:rgba(127,127,127,.08)">
+    <div style="font-size:.75rem;opacity:.7;margin-bottom:6px">{title}</div>
+    <div style="display:flex;justify-content:space-between;font-weight:600"><span>{a}</span><span>{aw}</span></div>
+    <hr style="margin:5px 0;border:none;border-top:1px solid #777">
+    <div style="display:flex;justify-content:space-between;font-weight:600"><span>{b}</span><span>{bw}</span></div>
+    </div>""",unsafe_allow_html=True)
+
+def show_bracket(league):
+    po=L["playoffs"][league]
+    if not po.get("generated"): return
+    z={s["SeriesID"]:s for s in po["series"]}
+    if league=="LHA":
+        st.markdown("### Playoff Bracket")
+        east,west=st.columns(2)
+        for col,d in [(east,"East"),(west,"West")]:
+            with col:
+                st.markdown(f"#### {d}")
+                c1,c2=st.columns(2)
+                with c1:
+                    for sid in [f"LHA-{d}-SF1",f"LHA-{d}-SF2"]:
+                        s=z[sid];bracket_card("Division Semifinal",s.get("Team1"),s.get("Team2"),series_wins(league,sid))
+                with c2:
+                    s=z[f"LHA-{d}-F"];bracket_card("Division Final",s.get("Team1"),s.get("Team2"),series_wins(league,s["SeriesID"]))
+        st.markdown("#### Meyers Memorial Cup Finals")
+        s=z["LHA-MMC-F"];center=st.columns([1,2,1])[1]
+        with center: bracket_card("Championship",s.get("Team1"),s.get("Team2"),series_wins(league,s["SeriesID"]))
+    else:
+        st.markdown("### Playoff Bracket")
+        c1,c2=st.columns(2)
+        with c1:
+            for sid in ["MLH-SF1","MLH-SF2"]:
+                s=z[sid];bracket_card("Semifinal",s.get("Team1"),s.get("Team2"),series_wins(league,sid))
+        with c2:
+            s=z["MLH-F"];bracket_card("MLH Championship",s.get("Team1"),s.get("Team2"),series_wins(league,s["SeriesID"]))
+
+st.title("🏒 LHA / MLH League Manager v2.5")
 page=st.sidebar.radio("Page",["Dashboard","Teams","Import / Setup","Weekly Games","Standings","Statistics","Game Log / Edit","Playoffs","Transactions & Honors","Commissioner Overrides","Backup / Export"])
 league=st.sidebar.radio("League view",["LHA","MLH"],horizontal=True)
 
@@ -270,17 +349,62 @@ elif page=="Teams":
     st.header(f"{league} Team Center")
     team=st.selectbox("Team",teams(league))
     d=rank(league,division(team) if league=="LHA" else None);row=d[d.Team.eq(team)].iloc[0];place=int(d.index[d.Team.eq(team)][0])+1
-    info=L["team_info"].setdefault(team,{"Coach":"","GM":"","Arena":"","Notes":""})
-    c=st.columns(6);c[0].metric("Standing",f"#{place}");c[1].metric("Record",f"{int(row.W)}-{int(row.L)}-{int(row.OTL)}");c[2].metric("Points",int(row.PTS));c[3].metric("GF",int(row.GF));c[4].metric("GA",int(row.GA));c[5].metric("Diff",f"{int(row.DIFF):+d}")
-    if league=="MLH":st.info("LHA affiliates: "+", ".join(AFFILIATES[team]))
-    with st.expander("Team information"):
-        with st.form("team_info"):
-            coach=st.text_input("Head Coach",info.get("Coach",""));gm=st.text_input("GM / Manager",info.get("GM",""));arena=st.text_input("Arena / Home Ice",info.get("Arena",""));notes=st.text_area("Notes",info.get("Notes",""));save=st.form_submit_button("Save")
-        if save:L["team_info"][team].update({"Coach":coach,"GM":gm,"Arena":arena,"Notes":notes});st.rerun()
+    info=L["team_info"].setdefault(team,deepcopy(INFO_DEFAULT))
+    for k,v in INFO_DEFAULT.items(): info.setdefault(k,v)
+
+    top_logo,top_info=st.columns([1,3])
+    with top_logo:
+        if info.get("LogoData"):
+            try: st.image(base64.b64decode(info["LogoData"]),use_container_width=True)
+            except Exception: st.caption("Saved logo could not be displayed.")
+        else:
+            st.markdown("### Team Logo")
+            st.caption("No logo uploaded yet.")
+    with top_info:
+        st.subheader(team)
+        if league=="MLH": st.caption("LHA affiliates: "+", ".join(AFFILIATES[team]))
+        c=st.columns(6);c[0].metric("Standing",f"#{place}");c[1].metric("Record",f"{int(row.W)}-{int(row.L)}-{int(row.OTL)}");c[2].metric("Points",int(row.PTS));c[3].metric("GF",int(row.GF));c[4].metric("GA",int(row.GA));c[5].metric("Diff",f"{int(row.DIFF):+d}")
+
+    with st.expander("Team information",expanded=True):
+        logo=st.file_uploader("Team logo",type=["png","jpg","jpeg","webp"],key=f"logo-{league}-{team}")
+        if logo is not None:
+            raw=logo.getvalue()
+            info["LogoData"]=base64.b64encode(raw).decode("ascii"); info["LogoType"]=logo.type
+            st.success("Logo loaded. It will be included in JSON backups.")
+        with st.form(f"team_info-{league}-{team}"):
+            a,b=st.columns(2)
+            with a:
+                coach=st.text_input("Head Coach",info.get("Coach",""))
+                gm=st.text_input("GM / Manager",info.get("GM",""))
+                arena=st.text_input("Arena / Home Ice",info.get("Arena",""))
+                champs=st.text_area("Championships",info.get("Championships",""),placeholder="e.g. 2024, 2027")
+            with b:
+                divtitles=st.text_area("Division Titles",info.get("DivisionTitles",""),placeholder="e.g. 2023, 2025")
+                retired=st.text_area("Retired Numbers",info.get("RetiredNumbers",""),placeholder="e.g. #9 — Player Name")
+                honors=st.text_area("Other Team Honors",info.get("TeamHonors",""),placeholder="Presidents' trophies, records, banners, etc.")
+                notes=st.text_area("Notes",info.get("Notes",""))
+            save=st.form_submit_button("Save team information")
+        if save:
+            L["team_info"][team].update({"Coach":coach,"GM":gm,"Arena":arena,"Championships":champs,
+                "DivisionTitles":divtitles,"RetiredNumbers":retired,"TeamHonors":honors,"Notes":notes})
+            st.rerun()
+        if info.get("LogoData") and st.button("Remove saved logo",key=f"rm-logo-{league}-{team}"):
+            info["LogoData"]="";info["LogoType"]="";st.rerun()
+
     ov,rt,stats,sch,hist=st.tabs(["Overview","Roster","Statistics","Schedule & Results","Transactions & Honors"])
     with ov:
-        st.write("**Coach:** "+(info.get("Coach") or "Not entered"));st.write("**Arena:** "+(info.get("Arena") or "Not entered"))
-        if league=="MLH":st.write("**Affiliates:** "+", ".join(AFFILIATES[team]))
+        a,b=st.columns(2)
+        with a:
+            st.write("**Coach:** "+(info.get("Coach") or "Not entered"))
+            st.write("**GM / Manager:** "+(info.get("GM") or "Not entered"))
+            st.write("**Arena:** "+(info.get("Arena") or "Not entered"))
+            if league=="MLH":st.write("**Affiliates:** "+", ".join(AFFILIATES[team]))
+        with b:
+            st.write("**Championships:** "+(info.get("Championships") or "None entered"))
+            st.write("**Division Titles:** "+(info.get("DivisionTitles") or "None entered"))
+            st.write("**Retired Numbers:** "+(info.get("RetiredNumbers") or "None entered"))
+            st.write("**Other Honors:** "+(info.get("TeamHonors") or "None entered"))
+        if info.get("Notes"): st.markdown("**Notes**");st.write(info["Notes"])
     with rt:
         r=df("rosters");r=r[(r.League.eq(league))&(r.Team.eq(team))&(r.Active.astype(bool))]
         st.dataframe(r[["Player","Position","Line","Scoring","Playmaking"]],hide_index=True,use_container_width=True) if not r.empty else st.info("No active roster.")
@@ -321,7 +445,8 @@ elif page=="Import / Setup":
         if u and st.button(f"Import {league} schedule"):
             try:
                 new=schedule_import(upload(u),league)
-                bad=set(new.Away)|set(new.Home)-set(teams(league))
+                bad=(set(new.Away)|set(new.Home))-set(teams(league))
+                if bad: raise ValueError("Unknown team name(s): "+", ".join(sorted(bad)))
                 L["schedule"]=[x for x in L["schedule"] if x.get("League","LHA")!=league]+new.to_dict("records")
                 st.success(f"{len(new)} {league} games imported.")
             except Exception as e:
@@ -404,6 +529,9 @@ elif page=="Playoffs":
     else:
         sync_playoffs(league)
         if po["champion"]:st.success("🏆 Champion: "+po["champion"])
+        show_bracket(league)
+        st.divider()
+        st.markdown("### Series Detail / Game Entry")
         labels=[f"{s['Round']} — {s.get('Team1') or 'TBD'} vs {s.get('Team2') or 'TBD'}" for s in po["series"]]
         pick_series=st.selectbox("Series",range(len(po["series"])),format_func=lambda i:labels[i])
         ser=po["series"][pick_series];high=ser.get("Team1","");low=ser.get("Team2","")
