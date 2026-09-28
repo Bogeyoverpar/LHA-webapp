@@ -3,17 +3,23 @@ import pandas as pd
 import numpy as np
 import random,json,io,uuid
 from copy import deepcopy
-st.set_page_config(page_title="LHA League Manager v2.2.1",page_icon="🏒",layout="wide")
+st.set_page_config(page_title="LHA League Manager v2.3",page_icon="🏒",layout="wide")
 
 DIV={"East":["Boston Titans","D.C. Daggers","Toronto Stars","New York Chiefs","Ottawa Capitals","Philadelphia Liberty"],
 "West":["Seattle Wildcats","Vancouver Pilots","Los Angeles Jets","Colorado Knights","Detroit Flames","Chicago Railers"]}
 SET={"assist_probs":[.08,.27,.65],"learning":.20,"win_pts":2,"otl_pts":1}
-def fresh(): return {"version":2.21,"rosters":[],"schedule":[],"games":[],"overrides":{"team":{},"status":{},"seed":{}},"playoffs":{"generated":False,"series":[],"champion":None},"settings":deepcopy(SET)}
+def fresh(): return {"version":2.3,"rosters":[],"schedule":[],"games":[],"transactions":[],"selections":[],"overrides":{"team":{},"status":{},"seed":{}},"playoffs":{"generated":False,"series":[],"champion":None},"settings":deepcopy(SET)}
 if "L" not in st.session_state: st.session_state.L=fresh()
 L=st.session_state.L
 for k,v in fresh().items():
     if k not in L:L[k]=deepcopy(v)
-ROSTER_COLS=["Team","Player","Position","Line","Scoring","Playmaking","Active"]
+# v2.3 migration: permanent player IDs and league level
+for rec in L.get("rosters",[]):
+    if not rec.get("PlayerID"):
+        rec["PlayerID"]="P-"+uuid.uuid4().hex[:10].upper()
+    rec.setdefault("Level","LHA")
+
+ROSTER_COLS=["PlayerID","Team","Player","Position","Line","Scoring","Playmaking","Active","Level"]
 SCHEDULE_COLS=["Week","Away","Home","Date","GameID"]
 def df(k):
     rows=L.get(k,[])
@@ -40,6 +46,8 @@ def roster_import(d):
     for c in ["Scoring","Playmaking"]:
         o[c]=pd.to_numeric(d[a[c.lower()]],errors="coerce").fillna(70).clip(1,99) if c.lower() in a else 70
     o["Active"]=d[a["active"]].astype(str).str.lower().isin(["true","1","yes","y"]) if "active" in a else True
+    o.insert(0,"PlayerID",["P-"+uuid.uuid4().hex[:10].upper() for _ in range(len(o))])
+    o["Level"]=d[a["level"]].astype(str).str.strip() if "level" in a else "LHA"
     return o[(o.Team!="")&(o.Player!="")]
 def schedule_import(d):
     a={str(c).strip().lower():c for c in d.columns};miss=[x for x in ["week","away","home"] if x not in a]
@@ -151,7 +159,9 @@ def makegame(gid,week,a,h,ag,hg,ot,agk,asa,hgk,hsa,stage="Regular",sid=None,ev=N
     if asa<hg or hsa<ag:raise ValueError("Shots against cannot be lower than goals allowed.")
     w=a if ag>hg else h
     qs=[{"Team":a,"Goalie":agk,"SA":asa,"SV":asa-hg,"GA":hg,"Result":"W" if w==a else "OTL" if ot else "L"},{"Team":h,"Goalie":hgk,"SA":hsa,"SV":hsa-ag,"GA":ag,"Result":"W" if w==h else "OTL" if ot else "L"}]
-    return {"GameID":gid,"Week":week,"Away":a,"Home":h,"AwayGoals":ag,"HomeGoals":hg,"OT":ot,"Stage":stage,"SeriesID":sid,"Events":ev if ev is not None else events(a,ag)+events(h,hg),"Goalies":qs}
+    return {"GameID":gid,"Week":week,"Away":a,"Home":h,"AwayGoals":ag,"HomeGoals":hg,"OT":ot,
+            "SeasonType":"Regular" if stage=="Regular" else "Playoffs","Stage":stage,"SeriesID":sid,
+            "Events":ev if ev is not None else events(a,ag)+events(h,hg),"Goalies":qs}
 def wins(sid):
     s=next(x for x in L["playoffs"]["series"] if x["SeriesID"]==sid);return {t:sum(((g["Away"]==t and g["AwayGoals"]>g["HomeGoals"])or(g["Home"]==t and g["HomeGoals"]>g["AwayGoals"])) for g in L["games"] if g.get("SeriesID")==sid) for t in [s["Team1"],s["Team2"]] if t}
 def sync():
@@ -172,34 +182,69 @@ def genpo():
     ss += [{"SeriesID":"MMC-F","Round":"Meyers Memorial Cup Finals","Division":"Final","Team1":"","Team2":""}]
     L["playoffs"]={"generated":True,"series":ss,"champion":None}
 
-st.title("🏒 LHA League Manager v2.2.1")
-page=st.sidebar.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","League Leaders","Game Log / Edit","Playoffs","Commissioner Overrides","Backup / Export"])
+
+def games_for_type(kind):
+    if kind=="Combined": return L["games"]
+    return [g for g in L["games"] if g.get("SeasonType","Regular" if g.get("Stage","Regular")=="Regular" else "Playoffs")==kind]
+
+def skaters_by_type(kind):
+    chosen=games_for_type(kind); go={};ast={};gp={}
+    r=df("rosters")
+    for g in chosen:
+        for t in [g["Away"],g["Home"]]:
+            for _,pr in r[r.Team.eq(t)].iterrows():
+                key=pr.get("PlayerID") or (t+"|"+pr.Player); gp[key]=gp.get(key,0)+1
+        for e in g.get("Events",[]):
+            k=e.get("ScorerID") or (e["Team"]+"|"+e.get("Scorer",""));go[k]=go.get(k,0)+1
+            for idkey,namekey in [("Assist1ID","Assist1"),("Assist2ID","Assist2")]:
+                nm=e.get(namekey,"")
+                if nm:
+                    k=e.get(idkey) or (e["Team"]+"|"+nm);ast[k]=ast.get(k,0)+1
+    rows=[]
+    for _,pr in r[~r.Position.map(P).eq("G")].iterrows():
+        k=pr.get("PlayerID") or (pr.Team+"|"+pr.Player)
+        if gp.get(k,0) or go.get(k,0) or ast.get(k,0):
+            rows.append({"PlayerID":pr.get("PlayerID",""),"Player":pr.Player,"Team":pr.Team,"GP":gp.get(k,0),"G":go.get(k,0),"A":ast.get(k,0),"PTS":go.get(k,0)+ast.get(k,0)})
+    return pd.DataFrame(rows)
+
+def goalies_by_type(kind):
+    rows=[q for g in games_for_type(kind) for q in g.get("Goalies",[])]
+    if not rows:return pd.DataFrame()
+    d=pd.DataFrame(rows);o=[]
+    for (t,p),x in d.groupby(["Team","Goalie"]):
+        sa=x.SA.sum();sv=x.SV.sum();ga=x.GA.sum();gp=len(x)
+        o.append({"Team":t,"Goalie":p,"GP":gp,"W":int((x.Result=="W").sum()),"L":int((x.Result=="L").sum()),"OTL":int((x.Result=="OTL").sum()),"SA":sa,"SV":sv,"GA":ga,"SO":int((x.GA==0).sum()),"SV%":round(sv/sa,3) if sa else 0,"GAA":round(ga/gp,2)})
+    return pd.DataFrame(o)
+
+def record_transaction(kind,pid,to_team,to_level,notes):
+    r=df("rosters"); matches=r.index[r.PlayerID.eq(pid)]
+    if not len(matches): raise ValueError("Player not found.")
+    i=int(matches[0]); old_team=L["rosters"][i]["Team"]; old_level=L["rosters"][i].get("Level","LHA")
+    if kind=="Release": L["rosters"][i]["Active"]=False
+    else:
+        if to_team:L["rosters"][i]["Team"]=to_team
+        if to_level:L["rosters"][i]["Level"]=to_level
+        L["rosters"][i]["Active"]=True
+    L["transactions"].append({"ID":"T-"+uuid.uuid4().hex[:8].upper(),"Type":kind,"PlayerID":pid,"Player":L["rosters"][i]["Player"],"FromTeam":old_team,"ToTeam":L["rosters"][i]["Team"],"FromLevel":old_level,"ToLevel":L["rosters"][i].get("Level","LHA"),"Notes":notes})
+
+def po_series_schedule(high,low):
+    return [(n, low if n in [1,2,6,7] else high, high if n in [1,2,6,7] else low) for n in range(1,8)]
+
+st.title("🏒 LHA League Manager v2.3")
+page=st.sidebar.radio("League",["Dashboard","Import / Setup","Weekly Games","Standings","Statistics","Game Log / Edit","Playoffs","Transactions & Honors","Commissioner Overrides","Backup / Export"])
 if page=="Import / Setup":
     st.caption(f"Current session: {len(df('rosters'))} roster rows • {len(df('schedule'))} scheduled games • {len(L['games'])} completed games")
     a,b=st.columns(2)
     with a:
         u=st.file_uploader("Roster CSV/XLSX",type=["csv","xlsx"])
         if u and st.button("Import roster"):
-            try:
-                imported_roster = roster_import(upload(u))
-                L["rosters"] = imported_roster.to_dict("records")
-                errors = validation()
-                if errors:
-                    for error in errors:
-                        st.warning(error)
-                else:
-                    st.success("Roster imported and validated.")
-            except Exception as e:
-                st.error(str(e))
+            try:L["rosters"]=roster_import(upload(u)).to_dict("records");[st.warning(x) for x in validation()] if validation() else st.success("Roster imported and validated.")
+            except Exception as e:st.error(str(e))
     with b:
         u=st.file_uploader("Schedule CSV/XLSX",type=["csv","xlsx"],key="su")
         if u and st.button("Import schedule"):
-            try:
-                imported_schedule = schedule_import(upload(u))
-                L["schedule"] = imported_schedule.to_dict("records")
-                st.success(f"Schedule imported: {len(imported_schedule)} games.")
-            except Exception as e:
-                st.error(str(e))
+            try:L["schedule"]=schedule_import(upload(u)).to_dict("records");st.success("Schedule imported.")
+            except Exception as e:st.error(str(e))
 elif page=="Weekly Games":
     s=df("schedule")
     if s.empty:st.info("Import a schedule first.")
@@ -270,26 +315,73 @@ elif page=="Game Log / Edit":
 elif page=="Playoffs":
     st.header("Meyers Memorial Cup Playoffs")
     if not L["playoffs"]["generated"]:
-        if st.button("Generate playoff bracket"):genpo();st.rerun()
+        if st.button("Generate playoff bracket",type="primary"):genpo();st.rerun()
     else:
         sync()
-        if st.button("Reset playoff bracket"):
-            # Playoff game records are retained unless deleted from Game Log / Edit.
-            L["playoffs"]={"generated":False,"series":[],"champion":None}
-            st.rerun()
         if L["playoffs"]["champion"]:st.success("🏆 Meyers Memorial Cup Champion: "+L["playoffs"]["champion"])
-        for s in L["playoffs"]["series"]:
-            st.subheader(s["Round"]+" — "+s["Division"]);t1,t2=s["Team1"],s["Team2"]
-            if not t1 or not t2:st.caption("Waiting for previous series.");continue
-            w=wins(s["SeriesID"]);st.write(f"**{t1} {w.get(t1,0)} — {w.get(t2,0)} {t2}**")
-            if max(w.values() or [0])>=4:continue
-            n=sum(w.values())+1
-            with st.form("po"+s["SeriesID"]):
-                away=st.selectbox("Away",[t1,t2],key="aa"+s["SeriesID"]);home=t2 if away==t1 else t1;st.write("Home: "+home);A=roster(away,True).Player.tolist();H=roster(home,True).Player.tolist()
-                ag=st.number_input("Away goals",0,30,0,key="ag"+s["SeriesID"]);hg=st.number_input("Home goals",0,30,0,key="hg"+s["SeriesID"]);agk=st.selectbox("Away goalie",A,key="ak"+s["SeriesID"]);hgk=st.selectbox("Home goalie",H,key="hk"+s["SeriesID"]);asa=st.number_input("Away goalie SA",0,100,25,key="as"+s["SeriesID"]);hsa=st.number_input("Home goalie SA",0,100,25,key="hs"+s["SeriesID"]);ot=st.checkbox("OT/SO",key="ot"+s["SeriesID"]);go=st.form_submit_button(f"Finalize Game {n}")
-            if go:
-                try:L["games"].append(makegame(f"PO-{s['SeriesID']}-G{n}",n,away,home,ag,hg,ot,agk,asa,hgk,hsa,s["Round"],s["SeriesID"]));sync();st.rerun()
-                except Exception as e:st.error(str(e))
+        for ser in L["playoffs"]["series"]:
+            # Old series records use Team1/Team2. Team1 is the higher seed when generated.
+            high=ser.get("HighSeed") or ser.get("Team1","");low=ser.get("LowSeed") or ser.get("Team2","")
+            with st.expander(f"{ser['Round']} — {ser['Division']}"+(f" • {high} vs {low}" if high and low else " • awaiting teams"),expanded=bool(high and low)):
+                if not high or not low:
+                    st.caption("Waiting for the preceding series.");continue
+                # Normalize for existing series-win function.
+                ser["Team1"]=high;ser["Team2"]=low
+                w=wins(ser["SeriesID"]);st.markdown(f"### {high} {w.get(high,0)} — {w.get(low,0)} {low}")
+                played={int(g["Week"]):g for g in L["games"] if g.get("SeriesID")==ser["SeriesID"]}
+                series_done=max(w.values() or [0])>=4
+                next_game=min([n for n in range(1,8) if n not in played],default=8)
+                for n,away,home in po_series_schedule(high,low):
+                    with st.container(border=True):
+                        st.markdown(f"**Game {n}: {away} at {home}**")
+                        if n in played:
+                            g=played[n];st.success(f"Final — {away} {g['AwayGoals']}, {home} {g['HomeGoals']}"+(" (OT/SO)" if g["OT"] else ""));st.caption("Edit from Game Log / Edit.")
+                        elif series_done:
+                            st.caption("Not necessary — series completed.")
+                        elif n!=next_game:
+                            st.caption("Locked until the preceding game is completed.")
+                        else:
+                            A=roster(away,True).Player.tolist();H=roster(home,True).Player.tolist()
+                            if not A or not H:st.error("Both teams need an active goalie.");continue
+                            with st.form(f"{ser['SeriesID']}-G{n}"):
+                                c1,c2=st.columns(2)
+                                with c1:ag=st.number_input(away+" goals",0,30,0,key=f"pag{ser['SeriesID']}{n}");agk=st.selectbox(away+" goalie",A,key=f"pak{ser['SeriesID']}{n}");asa=st.number_input(away+" goalie SA",0,100,25,key=f"pas{ser['SeriesID']}{n}")
+                                with c2:hg=st.number_input(home+" goals",0,30,0,key=f"phg{ser['SeriesID']}{n}");hgk=st.selectbox(home+" goalie",H,key=f"phk{ser['SeriesID']}{n}");hsa=st.number_input(home+" goalie SA",0,100,25,key=f"phs{ser['SeriesID']}{n}")
+                                ot=st.checkbox("OT / shootout",key=f"pot{ser['SeriesID']}{n}");go=st.form_submit_button("Finalize Game "+str(n))
+                            if go:
+                                try:
+                                    game=makegame(f"PO-{ser['SeriesID']}-G{n}",n,away,home,ag,hg,ot,agk,asa,hgk,hsa,ser["Round"],ser["SeriesID"])
+                                    game["SeasonType"]="Playoffs";L["games"].append(game);sync();st.rerun()
+                                except Exception as e:st.error(str(e))
+
+elif page=="Transactions & Honors":
+    st.header("Transactions & Honors")
+    r=df("rosters")
+    moves,log,honors=st.tabs(["Personnel Moves","Transaction Log","All-Star / All-Season"])
+    with moves:
+        if r.empty: st.info("Import a roster first.")
+        else:
+            active=r[r.Active.astype(bool)].copy()
+            pid=st.selectbox("Player",active.PlayerID.tolist(),format_func=lambda x:f"{active.loc[active.PlayerID==x,'Player'].iloc[0]} — {active.loc[active.PlayerID==x,'Team'].iloc[0]}")
+            kind=st.selectbox("Transaction",["Trade / Transfer","Call Up","Send Down","Release"])
+            to_team=st.selectbox("Destination team",sum(DIV.values(),[]),disabled=kind=="Release")
+            to_level=st.selectbox("Destination level",["LHA","Minor League"],index=1 if kind=="Send Down" else 0,disabled=kind=="Release")
+            notes=st.text_input("Notes")
+            if st.button("Record transaction & update roster"):
+                record_transaction(kind,pid,to_team,to_level,notes);st.success("Transaction recorded.");st.rerun()
+    with log:
+        d=df("transactions");st.dataframe(d,hide_index=True,use_container_width=True) if not d.empty else st.info("No transactions.")
+    with honors:
+        if r.empty:st.info("Import a roster first.")
+        else:
+            pid=st.selectbox("Player",r.PlayerID.tolist(),format_func=lambda x:f"{r.loc[r.PlayerID==x,'Player'].iloc[0]} — {r.loc[r.PlayerID==x,'Team'].iloc[0]}",key="honorpid")
+            honor=st.selectbox("Selection",["All-Star","All-Season First Team","All-Season Second Team","All-Season Honorable Mention"])
+            designation=st.text_input("Designation",placeholder="East All-Stars, First Team C, etc.")
+            notes=st.text_input("Notes",key="honornotes")
+            if st.button("Record selection"):
+                row=r[r.PlayerID.eq(pid)].iloc[0];L["selections"].append({"ID":"S-"+uuid.uuid4().hex[:8].upper(),"PlayerID":pid,"Player":row.Player,"Team":row.Team,"Selection":honor,"Designation":designation,"Notes":notes});st.rerun()
+            d=df("selections");st.dataframe(d,hide_index=True,use_container_width=True) if not d.empty else st.info("No selections.")
+
 elif page=="Commissioner Overrides":
     st.header("Commissioner Overrides")
     a,b,c=st.tabs(["Standings","Status","Seeds"])
